@@ -4887,6 +4887,13 @@ type ServerConfig struct {
 	// upgrade in order to fulfill the request. The Operator reserves the right
 	// to modify or replace any field.  More info:
 	// https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#pod-v1-core
+	//
+	// Setting the standard `kubectl.kubernetes.io/restartedAt` annotation here
+	// is a special case: it triggers a rolling restart of the pods belonging to
+	// this server class only (overriding any cluster-level value). The same
+	// annotation set on the CouchbaseCluster's top-level metadata triggers a
+	// rolling restart of every server pod. The value must be an RFC3339
+	// timestamp (e.g. produced by `date -u +%Y-%m-%dT%H:%M:%SZ`).
 	Pod *PodTemplate `json:"pod,omitempty"`
 
 	// VolumeMounts define persistent volume claims to attach to pod.

@@ -114,6 +114,7 @@ func CheckConstraints(v *types.Validator, cluster *couchbasev2.CouchbaseCluster)
 		checkClusterConstraintMagmaStorageBackend,
 		checkConstraintK8sSecurityContext,
 		checkConstraintMutuallyExclusiveUpgradeFields,
+		checkConstraintRestartedAtAnnotation,
 		checkConstraintBucketsAnnotations,
 		checkAdminServiceConstraints,
 		checkClusterRBACConstraints,
@@ -281,6 +282,41 @@ func checkConstraintPerServiceClassPDB(_ *types.Validator, cluster *couchbasev2.
 func checkConstraintMutuallyExclusiveUpgradeFields(_ *types.Validator, cluster *couchbasev2.CouchbaseCluster) error {
 	if (cluster.GetUpgradeProcess() == couchbasev2.InPlaceUpgrade || cluster.GetUpgradeProcess() == couchbasev2.DeltaRecovery) && cluster.GetUpgradeStrategy() == couchbasev2.ImmediateUpgrade {
 		return fmt.Errorf("cannot set spec.upgrade.upgradeStrategy to ImmediateUpgrade when spec.upgrade.upgradeProcess is set to InPlaceUpgrade or DeltaRecovery")
+	}
+
+	return nil
+}
+
+// checkConstraintRestartedAtAnnotation validates that any
+// kubectl.kubernetes.io/restartedAt annotation set on the cluster (top-level)
+// or on a per-server-class pod template is a parseable RFC3339 timestamp.
+func checkConstraintRestartedAtAnnotation(_ *types.Validator, cluster *couchbasev2.CouchbaseCluster) error {
+	validate := func(value, location string) error {
+		if value == "" {
+			return nil
+		}
+		if _, err := couchbasev2.ParsedRestartedAt(value); err != nil {
+			return fmt.Errorf("%s annotation %q on %s must be an RFC3339 timestamp: %w",
+				constants.RestartedAtAnnotation, value, location, err)
+		}
+		return nil
+	}
+
+	if v, ok := cluster.Annotations[constants.RestartedAtAnnotation]; ok {
+		if err := validate(v, "the CouchbaseCluster"); err != nil {
+			return err
+		}
+	}
+
+	for _, server := range cluster.Spec.Servers {
+		if server.Pod == nil {
+			continue
+		}
+		if v, ok := server.Pod.Annotations[constants.RestartedAtAnnotation]; ok {
+			if err := validate(v, fmt.Sprintf("server class %q", server.Name)); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil

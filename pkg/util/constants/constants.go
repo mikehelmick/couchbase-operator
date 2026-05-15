@@ -69,6 +69,15 @@ var (
 	ResourceVersionAnnotation     = "operator.couchbase.com/version"
 	CouchbaseHostnameAnnotation   = "server.couchbase.com/hostname"
 
+	// RestartedAtAnnotation is the standard kubectl annotation used to
+	// trigger a rolling restart of server pods. When set on a
+	// CouchbaseCluster, all server pods whose creationTimestamp is
+	// earlier than the annotation value are recreated through the
+	// rolling-upgrade pipeline. When set on a per-server-class
+	// pod.metadata.annotations, it overrides the cluster-level value
+	// for that class only. The value must be an RFC3339 timestamp.
+	RestartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
+
 	// Local storage annotation is used to identify a storage class
 	// that does not offer dynamic provisioning.
 	LocalStorageAnnotation = "storage.couchbase.com/local"

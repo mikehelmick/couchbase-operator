@@ -386,6 +386,35 @@ func (cs *ClusterSpec) ServerClassCouchbaseImage(server *ServerConfig) string {
 	return cs.CouchbaseImage()
 }
 
+// ResolvedRestartedAt returns the effective kubectl.kubernetes.io/restartedAt
+// annotation value for the given server class. The per-server-class Pod
+// template annotation (if present and non-empty) wins over the cluster-level
+// annotation. An empty string means no restart has been requested.
+//
+// Callers should compare the returned timestamp to a pod's creationTimestamp
+// to decide whether the pod must be recreated.
+func (c *CouchbaseCluster) ResolvedRestartedAt(server *ServerConfig) string {
+	if server != nil && server.Pod != nil {
+		if v, ok := server.Pod.Annotations[constants.RestartedAtAnnotation]; ok && v != "" {
+			return v
+		}
+	}
+	if v, ok := c.Annotations[constants.RestartedAtAnnotation]; ok {
+		return v
+	}
+	return ""
+}
+
+// ParsedRestartedAt parses a value previously returned by ResolvedRestartedAt
+// as an RFC3339 timestamp. The zero time is returned when the input is empty.
+// A non-nil error is returned for non-empty unparseable values.
+func ParsedRestartedAt(value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, value)
+}
+
 // LowestInUseCouchbaseVersionImage will get the lowest version couchbase image in the cluster
 // that is in use. Operator Environment image takes the highest priority.
 func (cs *ClusterSpec) LowestInUseCouchbaseVersionImage() (string, error) {

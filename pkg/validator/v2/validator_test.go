@@ -839,3 +839,90 @@ func TestCheckConstraintRestoreNameLength(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckConstraintRestartedAtAnnotation(t *testing.T) {
+	tests := []struct {
+		name    string
+		cluster *couchbasev2.CouchbaseCluster
+		wantErr string
+	}{
+		{
+			name:    "no annotation is fine",
+			cluster: &couchbasev2.CouchbaseCluster{},
+		},
+		{
+			name: "valid cluster-level RFC3339",
+			cluster: &couchbasev2.CouchbaseCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"kubectl.kubernetes.io/restartedAt": "2024-06-01T12:34:56Z",
+					},
+				},
+			},
+		},
+		{
+			name: "invalid cluster-level value",
+			cluster: &couchbasev2.CouchbaseCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"kubectl.kubernetes.io/restartedAt": "yesterday",
+					},
+				},
+			},
+			wantErr: "must be an RFC3339 timestamp",
+		},
+		{
+			name: "invalid per-class value",
+			cluster: &couchbasev2.CouchbaseCluster{
+				Spec: couchbasev2.ClusterSpec{
+					Servers: []couchbasev2.ServerConfig{{
+						Name: "data",
+						Pod: &couchbasev2.PodTemplate{
+							ObjectMeta: couchbasev2.ObjectMeta{
+								Annotations: map[string]string{
+									"kubectl.kubernetes.io/restartedAt": "nope",
+								},
+							},
+						},
+					}},
+				},
+			},
+			wantErr: `server class "data"`,
+		},
+		{
+			name: "valid per-class value",
+			cluster: &couchbasev2.CouchbaseCluster{
+				Spec: couchbasev2.ClusterSpec{
+					Servers: []couchbasev2.ServerConfig{{
+						Name: "data",
+						Pod: &couchbasev2.PodTemplate{
+							ObjectMeta: couchbasev2.ObjectMeta{
+								Annotations: map[string]string{
+									"kubectl.kubernetes.io/restartedAt": "2024-06-01T12:34:56Z",
+								},
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkConstraintRestartedAtAnnotation(nil, tt.cluster)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}

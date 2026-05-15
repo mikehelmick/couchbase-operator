@@ -132,6 +132,9 @@ const (
 
 	// Services mismatch.
 	EventReasonServicesMismatch = "ServicesMismatch"
+
+	// Rolling restart triggered via kubectl.kubernetes.io/restartedAt.
+	EventReasonRollingRestartTriggered = "RollingRestartTriggered"
 )
 
 func EventReasonServicesMismatchEvent(cl *couchbasev2.CouchbaseCluster) *v1.Event {
@@ -148,6 +151,19 @@ func EventReasonAdminPasswordChangedEvent(cl *couchbasev2.CouchbaseCluster) *v1.
 	event.Type = v1.EventTypeNormal
 	event.Reason = EventReasonAdminPasswordChanged
 	event.Message = "The cluster admin password was changed"
+
+	return event
+}
+
+// RollingRestartTriggeredEvent records that a rolling restart has been
+// requested via kubectl.kubernetes.io/restartedAt. Scope describes whether the
+// trigger was cluster-wide ("cluster") or limited to a specific server class
+// (the class name). Count is the number of pods scheduled for recreation.
+func RollingRestartTriggeredEvent(cl *couchbasev2.CouchbaseCluster, scope string, count int) *v1.Event {
+	event := newClusterEvent(cl)
+	event.Type = v1.EventTypeNormal
+	event.Reason = EventReasonRollingRestartTriggered
+	event.Message = fmt.Sprintf("Rolling restart triggered (%s scope), %d pod(s) scheduled for recreation", scope, count)
 
 	return event
 }

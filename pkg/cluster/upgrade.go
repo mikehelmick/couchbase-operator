@@ -76,6 +76,7 @@ func (c *Cluster) detectChangeSets() (*ChangeSet, error) {
 type podChangeInfo struct {
 	needsVersionChange bool
 	needsSpecChange    bool
+	needsRestart       bool
 	currentImage       string
 	specImage          string
 	actualSpec         *v1.PodSpec
@@ -114,15 +115,45 @@ func (c *Cluster) analyzePodChange(name string, member couchbaseutil.Member, mov
 		return nil, err
 	}
 
+	needsRestart, err := c.checkNeedsRestart(actual, serverClass)
+	if err != nil {
+		return nil, err
+	}
+
 	return &podChangeInfo{
 		needsVersionChange: needsVersionChange,
 		needsSpecChange:    needsSpecChange,
+		needsRestart:       needsRestart,
 		currentImage:       currentImage,
 		specImage:          specImage,
 		actualSpec:         actualSpec,
 		preservedSpec:      preservedSpec,
 		pvcState:           pvcState,
 	}, nil
+}
+
+// checkNeedsRestart returns true when the pod's creationTimestamp predates the
+// resolved kubectl.kubernetes.io/restartedAt annotation for its server class.
+// This is the trigger for a rolling restart and is intentionally independent of
+// the podspec hash: changing the annotation must not appear as a spec drift.
+func (c *Cluster) checkNeedsRestart(actual *v1.Pod, serverClass *couchbasev2.ServerConfig) (bool, error) {
+	resolved := c.cluster.ResolvedRestartedAt(serverClass)
+	if resolved == "" {
+		return false, nil
+	}
+
+	restartedAt, err := couchbasev2.ParsedRestartedAt(resolved)
+	if err != nil {
+		// Validation should have caught this; tolerate it at runtime by
+		// not triggering restarts on an unparseable value.
+		log.Info("Ignoring unparseable kubectl.kubernetes.io/restartedAt annotation",
+			"cluster", c.namespacedName(),
+			"value", resolved,
+			"error", err.Error())
+		return false, nil
+	}
+
+	return actual.CreationTimestamp.Time.Before(restartedAt), nil
 }
 
 // checkSpecChange determines if a pod needs specification changes.
@@ -161,15 +192,26 @@ func (c *Cluster) checkSpecChange(member couchbaseutil.Member, actual *v1.Pod, s
 }
 
 // categorizePodChange adds a pod to the appropriate change set based on its change type.
+//
+// A pure restart (needsRestart && !needsVersionChange && !needsSpecChange) is
+// routed into SpecOnly so that it flows through the existing rolling-recreation
+// pipeline (RollingUpgradeConstraints, UpgradeProcess, swap-rebalance, etc.).
+// The podspec hash is not modified — recreation alone advances the new pod's
+// creationTimestamp past the restartedAt value, which acknowledges the request.
 func (c *Cluster) categorizePodChange(result *ChangeSet, name string, member couchbaseutil.Member, info *podChangeInfo) {
+	// Restart is satisfied by recreation, so collapse it into the spec-change
+	// path for routing purposes.
+	needsRecreate := info.needsSpecChange || info.needsRestart
+
 	switch {
-	case info.needsVersionChange && info.needsSpecChange:
+	case info.needsVersionChange && needsRecreate:
 		result.Both.Add(member)
 		log.V(1).Info("Pod needs both version and spec changes",
 			"cluster", c.namespacedName(),
 			"pod", name,
 			"currentImage", info.currentImage,
-			"specImage", info.specImage)
+			"specImage", info.specImage,
+			"restartRequested", info.needsRestart)
 	case info.needsVersionChange:
 		result.VersionOnly.Add(member)
 		log.V(1).Info("Pod needs version change only",
@@ -177,11 +219,18 @@ func (c *Cluster) categorizePodChange(result *ChangeSet, name string, member cou
 			"pod", name,
 			"currentImage", info.currentImage,
 			"specImage", info.specImage)
-	case info.needsSpecChange:
+	case needsRecreate:
 		result.SpecOnly.Add(member)
-		log.V(1).Info("Pod needs spec change only",
-			"cluster", c.namespacedName(),
-			"pod", name)
+		if info.needsRestart && !info.needsSpecChange {
+			log.V(1).Info("Pod needs rolling restart",
+				"cluster", c.namespacedName(),
+				"pod", name,
+				"restartedAt", c.cluster.ResolvedRestartedAt(c.cluster.Spec.GetServerConfigByName(member.Config())))
+		} else {
+			log.V(1).Info("Pod needs spec change only",
+				"cluster", c.namespacedName(),
+				"pod", name)
+		}
 	}
 
 	if info.needsSpecChange && detectZoneChange(info.actualSpec, info.preservedSpec, info.pvcState) {

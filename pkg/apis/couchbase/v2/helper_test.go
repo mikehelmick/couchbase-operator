@@ -204,3 +204,110 @@ func TestMigrateDeprecatedRoles(t *testing.T) {
 		})
 	}
 }
+
+func TestResolvedRestartedAt(t *testing.T) {
+	const (
+		clusterTS = "2024-01-01T00:00:00Z"
+		classTS   = "2024-06-01T00:00:00Z"
+	)
+	classWithAnno := func(name, value string) ServerConfig {
+		sc := ServerConfig{Name: name}
+		if value != "" {
+			sc.Pod = &PodTemplate{
+				ObjectMeta: ObjectMeta{
+					Annotations: map[string]string{
+						"kubectl.kubernetes.io/restartedAt": value,
+					},
+				},
+			}
+		}
+		return sc
+	}
+
+	tests := []struct {
+		name       string
+		clusterAnn map[string]string
+		server     *ServerConfig
+		want       string
+	}{
+		{name: "no annotations", want: ""},
+		{
+			name:       "cluster only",
+			clusterAnn: map[string]string{"kubectl.kubernetes.io/restartedAt": clusterTS},
+			server:     &ServerConfig{Name: "data"},
+			want:       clusterTS,
+		},
+		{
+			name: "per-class only",
+			server: func() *ServerConfig {
+				sc := classWithAnno("data", classTS)
+				return &sc
+			}(),
+			want: classTS,
+		},
+		{
+			name:       "per-class wins over cluster",
+			clusterAnn: map[string]string{"kubectl.kubernetes.io/restartedAt": clusterTS},
+			server: func() *ServerConfig {
+				sc := classWithAnno("data", classTS)
+				return &sc
+			}(),
+			want: classTS,
+		},
+		{
+			name:       "empty per-class falls back to cluster",
+			clusterAnn: map[string]string{"kubectl.kubernetes.io/restartedAt": clusterTS},
+			server: func() *ServerConfig {
+				sc := classWithAnno("data", "")
+				sc.Pod = &PodTemplate{ObjectMeta: ObjectMeta{Annotations: map[string]string{
+					"kubectl.kubernetes.io/restartedAt": "",
+				}}}
+				return &sc
+			}(),
+			want: clusterTS,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &CouchbaseCluster{}
+			c.Annotations = tt.clusterAnn
+			if got := c.ResolvedRestartedAt(tt.server); got != tt.want {
+				t.Errorf("ResolvedRestartedAt = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParsedRestartedAt(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+		zero    bool
+	}{
+		{name: "empty is zero time", value: "", zero: true},
+		{name: "valid RFC3339", value: "2024-06-01T12:34:56Z"},
+		{name: "valid with offset", value: "2024-06-01T12:34:56-07:00"},
+		{name: "garbage rejected", value: "not-a-timestamp", wantErr: true},
+		{name: "missing TZ rejected", value: "2024-06-01T12:34:56", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParsedRestartedAt(tt.value)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.zero && !got.IsZero() {
+				t.Errorf("expected zero time, got %v", got)
+			}
+		})
+	}
+}
