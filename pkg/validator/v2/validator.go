@@ -4173,15 +4173,6 @@ func CheckConstraintsScope(v *types.Validator, scope *couchbasev2.CouchbaseScope
 		return nil
 	}
 
-	// Initialize the collection and collection group caches to avoid hitting apiserver rate limits.
-	if err := v.Abstraction.InitCollectionCache(scope.Namespace); err != nil {
-		return err
-	}
-
-	if err := v.Abstraction.InitCollectionGroupCache(scope.Namespace); err != nil {
-		return err
-	}
-
 	if err := checkScopeCollectionsUnique(v, scope.Namespace, couchbasev2.ScopeCRDResourceKind, scope.Name, scope.Spec.Collections); err != nil {
 		errs = append(errs, err)
 	}
@@ -4202,15 +4193,6 @@ func CheckConstraintsScopeGroup(v *types.Validator, scopeGroup *couchbasev2.Couc
 
 	if checkAnnotationSkipValidation(scopeGroup.Annotations) {
 		return nil
-	}
-
-	// Initialize the collection and collection group caches to avoid hitting apiserver rate limits.
-	if err := v.Abstraction.InitCollectionCache(scopeGroup.Namespace); err != nil {
-		return err
-	}
-
-	if err := v.Abstraction.InitCollectionGroupCache(scopeGroup.Namespace); err != nil {
-		return err
 	}
 
 	if err := checkScopeCollectionsUnique(v, scopeGroup.Namespace, couchbasev2.ScopeGroupCRDResourceKind, scopeGroup.Name, scopeGroup.Spec.Collections); err != nil {
@@ -4463,15 +4445,6 @@ func validateKMIPKey(v *types.Validator, key *couchbasev2.CouchbaseEncryptionKey
 // we check every scope in the namespace in case a scope references the collection, before validating
 // each of those scopes individually.
 func checkAllScopeCollectionsUnique(v *types.Validator, namespace string) error {
-	// Initialize the collection and collection group caches to avoid hitting apiserver rate limits.
-	if err := v.Abstraction.InitCollectionCache(namespace); err != nil {
-		return err
-	}
-
-	if err := v.Abstraction.InitCollectionGroupCache(namespace); err != nil {
-		return err
-	}
-
 	scopes, err := v.Abstraction.GetCouchbaseScopes(namespace, nil)
 	if err != nil {
 		return err
@@ -5041,10 +5014,6 @@ func CheckChangeConstraintsCluster(v *types.Validator, prev, curr *couchbasev2.C
 		errs = append(errs, err)
 	}
 
-	if err := checkChangeConstraintsBucketMigratingAnnotation(prev, curr); err != nil {
-		errs = append(errs, err)
-	}
-
 	if err := checkClusterUpgradePrerequisites(v, prev, curr); err != nil {
 		errs = append(errs, err)
 	}
@@ -5193,8 +5162,9 @@ func checkClusterUpgradePrerequisites(v *types.Validator, prev, curr *couchbasev
 		return nil
 	}
 
-	if (curr.HasCondition(couchbasev2.ClusterConditionBucketMigration) || prev.HasCondition(couchbasev2.ClusterConditionBucketMigration)) && prev.Spec.Image != curr.Spec.Image {
-		return fmt.Errorf("cannot upgrade cluster while bucket migration is in progress")
+	bucketMigrating := curr.HasCondition(couchbasev2.ClusterConditionBucketMigration) || prev.HasCondition(couchbasev2.ClusterConditionBucketMigration)
+	if bucketMigrating && prev.Spec.Image != curr.Spec.Image {
+		return fmt.Errorf("cannot upgrade cluster while bucket storage backend migration is in progress")
 	}
 
 	startVersion, err := k8sutil.CouchbaseVersion(prev.Spec.CouchbaseImage())
@@ -5355,12 +5325,6 @@ func CheckChangeConstraintsBucket(v *types.Validator, prev, curr *couchbasev2.Co
 
 		if !after80 {
 			continue
-		}
-
-		if !c.Spec.Buckets.EnableBucketMigrationRoutines {
-			if curr.Spec.EvictionPolicy != prev.Spec.EvictionPolicy && curr.Spec.OnlineEvictionPolicyChange {
-				errs = append(errs, fmt.Errorf("spec.evictionPolicy cannot be changed unless all referencing clusters have spec.buckets.enableBucketMigrationRoutines set to true"))
-			}
 		}
 
 		if err := checkNumVBucketsChangeConstraint(prev, curr, c, c); err != nil {
@@ -5900,16 +5864,6 @@ func checkClusterGroupRBACConstraints(v *types.Validator, cluster *couchbasev2.C
 					return fmt.Errorf("role %s in group %s requires Couchbase Server 8.0+", r.Name, g.Name)
 				}
 			}
-		}
-	}
-
-	return nil
-}
-
-func checkChangeConstraintsBucketMigratingAnnotation(prev, current *couchbasev2.CouchbaseCluster) error {
-	if prev.Spec.Buckets.EnableBucketMigrationRoutines != current.Spec.Buckets.EnableBucketMigrationRoutines {
-		if cond := prev.Status.GetCondition(couchbasev2.ClusterConditionBucketMigration); cond != nil && cond.Status == v1.ConditionTrue {
-			return fmt.Errorf("spec.buckets.enableBucketMigrationRoutines cannot be changed while a bucket migration is taking place")
 		}
 	}
 

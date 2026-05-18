@@ -135,7 +135,13 @@ func gatherCouchbaseBuckets(supportedFeatures SupportedFeatureMap, selector labe
 
 			// CDC is only supported on Magma
 			if supportedHistoryRetention && bucket.Spec.HistoryRetentionSettings != nil {
-				b.HistoryRetentionCollectionDefault = bucket.Spec.HistoryRetentionSettings.CollectionDefault
+				// Only override the collection default when the user explicitly
+				// sets it.  When nil the earlier magma default (true) is kept so
+				// that a magma bucket always has collectionHistoryDefault=true
+				// unless the user explicitly opts out.
+				if bucket.Spec.HistoryRetentionSettings.CollectionDefault != nil {
+					b.HistoryRetentionCollectionDefault = bucket.Spec.HistoryRetentionSettings.CollectionDefault
+				}
 				b.HistoryRetentionBytes = bucket.Spec.HistoryRetentionSettings.Bytes
 				b.HistoryRetentionSeconds = bucket.Spec.HistoryRetentionSettings.Seconds
 			}
@@ -201,10 +207,8 @@ func gatherCouchbaseBuckets(supportedFeatures SupportedFeatureMap, selector labe
 				b.DurabilityImpossibleFallback = constants.DurabilityImpossibleFallbackDefault
 			}
 
-			if bucket.Spec.OnlineEvictionPolicyChange {
-				noRestart := true
-				b.NoRestart = &noRestart
-			}
+			noRestart := bucket.Spec.OnlineEvictionPolicyChange
+			b.NoRestart = &noRestart
 
 			b.EncryptionAtRestDekRotationInterval = util.IntPtr(constants.DefaultEncryptionAtRestRotationInterval)
 			b.EncryptionAtRestDekLifetime = util.IntPtr(constants.DefaultEncryptionAtRestKeyLifetime)
@@ -509,11 +513,20 @@ func (c *Cluster) GetBucketsToUpdate() (map[couchbaseutil.Bucket]couchbaseutil.B
 	return updateBuckets, nil
 }
 
+// bucketUpdate holds the CBS-actual (from) and CRD-desired (to) representations of a
+// bucket that requires an update.  Carrying both values allows the reconcile loop to
+// detect field-level transitions (e.g. collectionHistoryDefault true→false) without
+// an additional CBS REST call.
+type bucketUpdate struct {
+	from couchbaseutil.Bucket
+	to   couchbaseutil.Bucket
+}
+
 // inspectBuckets compares Kubernetes buckets with Couchbase buckets and returns lists
 // of buckets to create, update or remove and the requested set for status updates.
 //
 //nolint:gocognit,gocyclo
-func (c *Cluster) inspectBuckets() ([]couchbaseutil.Bucket, []couchbaseutil.Bucket, []couchbaseutil.Bucket, []couchbaseutil.Bucket, []couchbaseutil.Bucket, error) {
+func (c *Cluster) inspectBuckets() ([]couchbaseutil.Bucket, []bucketUpdate, []couchbaseutil.Bucket, []couchbaseutil.Bucket, []couchbaseutil.Bucket, error) {
 	unfilteredRequested, err := c.gatherBuckets()
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
@@ -547,7 +560,7 @@ func (c *Cluster) inspectBuckets() ([]couchbaseutil.Bucket, []couchbaseutil.Buck
 	atLeast80 := c.SupportsVersionFeatures("8.0.0")
 
 	create := []couchbaseutil.Bucket{}
-	update := []couchbaseutil.Bucket{}
+	update := []bucketUpdate{}
 	updateDuringMigration := []couchbaseutil.Bucket{}
 	remove := []couchbaseutil.Bucket{}
 
@@ -578,11 +591,10 @@ func (c *Cluster) inspectBuckets() ([]couchbaseutil.Bucket, []couchbaseutil.Buck
 					a.NumVBuckets = nil
 				}
 
-				// We have to do this to prevent deepEqual from updating the bucket just because of the NoRestart field.
-				// This is OK to do as we don't actually get a.NoRestart from the API endpoint we just infer it and
-				// once an offline eviction policy change is requested, we can't do anything about it so this difference doesn't matter.
-				// On the other hande if a.NoRestart is true and r.NoRestart is false, we want to switch from and online upgrade to an offline upgrade.
-				if r.NoRestart != nil && *r.NoRestart && r.NoRestart != a.NoRestart {
+				// Normalize a.NoRestart when CBS reports no per-node overrides (nil).
+				// If overrides exist (a=&true) and user wants offline (r=&false), the
+				// diff is kept so UpdateBucket sends noRestart=false to trigger a restart.
+				if r.NoRestart != nil && a.NoRestart == nil {
 					a.NoRestart = r.NoRestart
 				}
 
@@ -610,12 +622,13 @@ func (c *Cluster) inspectBuckets() ([]couchbaseutil.Bucket, []couchbaseutil.Buck
 				} else if !reflect.DeepEqual(r, a) {
 					setBucketFieldsForEncoding(&r, isOver71)
 
-					// During migration, use specialized API that only sends allowed fields.
-					// Otherwise, use normal full update.
+					// During storage backend migration, use specialized API that only sends
+					// fields CBS allows during migration. For eviction-only migration
+					// (BucketEvictionMigrating), use the normal path so all fields are sent.
 					if c.cluster.HasCondition(couchbasev2.ClusterConditionBucketMigration) {
 						updateDuringMigration = append(updateDuringMigration, r)
 					} else {
-						update = append(update, r)
+						update = append(update, bucketUpdate{from: a, to: r})
 					}
 					c.logUpdate(a, r)
 				}
@@ -725,6 +738,35 @@ func doCrossClusterVersioningChecks(r, a *couchbaseutil.Bucket, cluster *couchba
 	}
 }
 
+// applyBucketUpdates applies a set of bucket updates, patching _default/_default
+// history before the CBS call when collectionHistoryDefault transitions true→false.
+func (c *Cluster) applyBucketUpdates(updates []bucketUpdate) error {
+	for i := range updates {
+		u := &updates[i]
+
+		// If collectionHistoryDefault is transitioning from true to false, patch
+		// _default/_default to history=false before the bucket update.
+		chdChangingToFalse := u.from.HistoryRetentionCollectionDefault != nil &&
+			*u.from.HistoryRetentionCollectionDefault &&
+			u.to.HistoryRetentionCollectionDefault != nil &&
+			!*u.to.HistoryRetentionCollectionDefault
+		if chdChangingToFalse {
+			if err := c.patchDefaultCollectionHistory(u.to.BucketName); err != nil {
+				return err
+			}
+		}
+
+		if err := couchbaseutil.UpdateBucket(&u.to).On(c.api, c.readyMembers()); err != nil {
+			return err
+		}
+
+		log.Info("Bucket updated", "cluster", c.namespacedName(), "name", u.to.BucketName)
+		c.raiseEvent(k8sutil.BucketEditEvent(u.to.BucketName, c.cluster))
+	}
+
+	return nil
+}
+
 // reconcile buckets by adding or removing
 // buckets one at a time based on comparison
 // of existing buckets to cluster spec.
@@ -740,7 +782,7 @@ func (c *Cluster) reconcileBuckets() error {
 		return nil
 	}
 
-	create, update, updateDuringMigration, remove, requested, err := c.inspectBuckets()
+	create, updates, updateDuringMigration, remove, requested, err := c.inspectBuckets()
 	if err != nil {
 		return err
 	}
@@ -776,15 +818,8 @@ func (c *Cluster) reconcileBuckets() error {
 		c.raiseEvent(k8sutil.BucketCreateEvent(bucket.BucketName, c.cluster))
 	}
 
-	for i := range update {
-		bucket := &update[i]
-
-		if err := couchbaseutil.UpdateBucket(bucket).On(c.api, c.readyMembers()); err != nil {
-			return err
-		}
-
-		log.Info("Bucket updated", "cluster", c.namespacedName(), "name", bucket.BucketName)
-		c.raiseEvent(k8sutil.BucketEditEvent(bucket.BucketName, c.cluster))
+	if err := c.applyBucketUpdates(updates); err != nil {
+		return err
 	}
 
 	for i := range updateDuringMigration {
@@ -920,6 +955,35 @@ func (c *Cluster) canBucketBeMigrated(b couchbaseutil.Bucket, backend couchbaseu
 	}
 
 	return true, ""
+}
+
+// patchDefaultCollectionHistory disables history retention on the _default scope's
+// _default collection and is called as part of a magma → couchstore backend migration.
+// That collection is never managed by a user CRD (it is preserved implicitly), so the
+// operator is responsible for clearing its history flag before the backend change.
+// The Couchbase Server does not retroactively propagate a bucket-level
+// collectionHistoryDefault change to existing collections.
+func (c *Cluster) patchDefaultCollectionHistory(bucketName string) error {
+	scopes := couchbaseutil.ScopeList{}
+	if err := couchbaseutil.ListScopes(bucketName, &scopes).On(c.api, c.readyMembers()); err != nil {
+		return fmt.Errorf("failed to list scopes for bucket %s: %w", bucketName, err)
+	}
+
+	defaultCollection := scopes.GetScope("_default").GetCollection("_default")
+	if defaultCollection.Name == "" || defaultCollection.History == nil || !*defaultCollection.History {
+		return nil
+	}
+
+	falseVal := false
+	defaultCollection.History = &falseVal
+	if err := couchbaseutil.PatchCollection(bucketName, "_default", defaultCollection).On(c.api, c.readyMembers()); err != nil {
+		return fmt.Errorf("failed to disable history retention on _default/_default in bucket %s: %w", bucketName, err)
+	}
+
+	log.Info("Disabled history retention on _default/_default collection for storage backend migration",
+		"cluster", c.namespacedName(), "bucket", bucketName)
+
+	return nil
 }
 
 // gatherBucketAutoCompactionSettings will convert auto-compaction settings defined on bucket CRD's into auto-compaction settings that can be recognised
